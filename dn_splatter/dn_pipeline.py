@@ -83,7 +83,7 @@ class DNSplatterPipeline(VanillaPipeline):
             world_size=world_size,
             local_rank=local_rank,
         )
-        self.datamanager.to(device)
+        # self.datamanager.to(device) # does not exist - error
 
         seed_pts = None
         if (
@@ -105,7 +105,7 @@ class DNSplatterPipeline(VanillaPipeline):
             else:
                 seed_pts = (pts, pts_rgb)
 
-        self.datamanager.to(device)
+        # self.datamanager.to(device)
         # TODO(ethan): get rid of scene_bounds from the model
         assert self.datamanager.train_dataset is not None, "Missing input dataset"
 

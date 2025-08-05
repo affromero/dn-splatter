@@ -7,6 +7,7 @@ import random
 from dataclasses import dataclass, field
 from typing import Dict, List, Literal, Optional, Tuple, Type, Union
 
+import numpy as np
 import torch
 import torch.nn.functional as F
 import torchvision.transforms.functional as TF
@@ -27,12 +28,10 @@ from dn_splatter.utils.knn import knn_sk
 from dn_splatter.utils.normal_utils import normal_from_depth_image
 
 try:
-    from gsplat.rendering import rasterization
+    from gsplat.rendering import rasterization, rasterization_2dgs
 except ImportError:
     print("Please install gsplat>=1.0.0")
-from gsplat import rasterize_gaussians
-from gsplat.cuda_legacy._torch_impl import quat_to_rotmat
-from gsplat.cuda_legacy._wrapper import num_sh_bases
+from gsplat.cuda._torch_impl import _quat_to_rotmat as quat_to_rotmat
 from nerfstudio.cameras.camera_optimizers import CameraOptimizer, CameraOptimizerConfig
 from nerfstudio.cameras.cameras import Cameras
 from nerfstudio.data.scene_box import OrientedBox
@@ -50,7 +49,11 @@ from nerfstudio.models.splatfacto import (
 )
 from nerfstudio.utils.colors import get_color
 from nerfstudio.utils.rich_utils import CONSOLE
+from sklearn.neighbors import NearestNeighbors
 
+def num_sh_bases(degree):
+    # https://github.com/nerfstudio-project/nerfstudio/issues/3308#issuecomment-2412923848
+    return (degree + 1) ** 2
 
 @dataclass
 class DNSplatterModelConfig(SplatfactoModelConfig):
@@ -121,6 +124,9 @@ class DNSplatterModelConfig(SplatfactoModelConfig):
     # pearson depth loss lambda
     pearson_lambda: float = 0
     """Regularizer for pearson depth loss"""
+
+    continue_cull_post_densification: bool = False
+    """If True, continue culling post densification."""
 
 
 class DNSplatterModel(SplatfactoModel):
@@ -267,6 +273,33 @@ class DNSplatterModel(SplatfactoModel):
     @property
     def normals(self):
         return self.gauss_params["normals"]
+
+    def k_nearest_sklearn(self, points: Tensor, k: int) -> Tuple[np.ndarray, np.ndarray]:
+        """Find k-nearest neighbors using sklearn's NearestNeighbors.
+        
+        Args:
+            points: Input points tensor (N, D)
+            k: Number of nearest neighbors to find
+            
+        Returns:
+            Tuple of (distances, indices) where distances and indices are numpy arrays
+        """
+        
+        # Convert to numpy for sklearn
+        points_np = points.cpu().numpy()
+        
+        # Create and fit the nearest neighbors model
+        nn_model = NearestNeighbors(
+            n_neighbors=k + 1,  # +1 because we exclude the point itself
+            algorithm="auto",
+            metric="euclidean"
+        ).fit(points_np)
+        
+        # Find k+1 nearest neighbors (including the point itself)
+        distances, indices = nn_model.kneighbors(points_np)
+        
+        # Remove the first neighbor (the point itself) and return
+        return distances[:, 1:], indices[:, 1:]
 
     def refinement_after(self, optimizers: Optimizers, step):
         assert step == self.step
@@ -495,7 +528,7 @@ class DNSplatterModel(SplatfactoModel):
         render, alpha, info = rasterization(
             means=means_crop,
             quats=quats_crop / quats_crop.norm(dim=-1, keepdim=True),
-            scales=torch.exp(scales_crop),
+            scales=torch.exp(scales_crop).float(),
             opacities=torch.sigmoid(opacities_crop).squeeze(-1),
             colors=colors_crop,
             viewmats=viewmat,  # [1, 4, 4]
@@ -559,19 +592,24 @@ class DNSplatterModel(SplatfactoModel):
             # convert normals from world space to camera space
             normals = normals @ camera.camera_to_worlds.squeeze(0)[:3, :3]
 
-            xys = self.xys[0, ...].detach()
-
-            normals_im: Tensor = rasterize_gaussians(  # type: ignore
-                xys,
-                self.depths[0, ...],
-                self.radii,
-                self.conics[0, ...],
-                self.num_tiles_hit[0, ...],
-                normals,
-                torch.sigmoid(opacities_crop),
-                H,
-                W,
-                BLOCK_WIDTH,
+            # Use the current gsplat API for normal rendering
+            _, _, normals_im, _, _, _, _ = rasterization_2dgs(
+                means=means_crop,
+                quats=quats_crop / quats_crop.norm(dim=-1, keepdim=True),
+                scales=torch.exp(scales_crop).float(),
+                opacities=torch.sigmoid(opacities_crop).squeeze(-1),
+                colors=normals,  # Use normals as colors for normal rendering
+                viewmats=viewmat,  # [1, 4, 4]
+                Ks=K,  # [1, 3, 3]
+                width=W,
+                height=H,
+                tile_size=BLOCK_WIDTH,
+                packed=False,
+                near_plane=0.01,
+                far_plane=1e10,
+                render_mode="RGB",  # We're rendering normals as RGB
+                sparse_grad=False,
+                absgrad=True,
             )
             # convert normals from [-1,1] to [0,1]
             normals_im = normals_im / normals_im.norm(dim=-1, keepdim=True)
@@ -893,6 +931,7 @@ class DNSplatterModel(SplatfactoModel):
             }
             metrics_dict.update(depth_metrics)
             combined_depth = torch.cat([gt_depth, predicted_depth], dim=1)
+            combined_depth_normalized = combined_depth / combined_depth.max()
 
         if "normal" in batch:
             gt_normal = batch["normal"].to(self.device)
@@ -919,7 +958,7 @@ class DNSplatterModel(SplatfactoModel):
 
         images_dict = {
             "img": combined_rgb,
-            "depth": combined_depth,
+            "depth": combined_depth_normalized,
             "normal": combined_normal,
         }
 
@@ -931,23 +970,29 @@ class DNSplatterModel(SplatfactoModel):
         cbs = []
         cbs.append(
             TrainingCallback(
-                [TrainingCallbackLocation.BEFORE_TRAIN_ITERATION], self.step_cb
-            )
-        )
-        # The order of these matters
-        cbs.append(
-            TrainingCallback(
-                [TrainingCallbackLocation.AFTER_TRAIN_ITERATION], self.after_train
-            )
-        )
-        cbs.append(
-            TrainingCallback(
-                [TrainingCallbackLocation.AFTER_TRAIN_ITERATION],
-                self.refinement_after,
-                update_every_num_iters=self.config.refine_every,
+                [TrainingCallbackLocation.BEFORE_TRAIN_ITERATION],
+                self.step_cb,
                 args=[training_callback_attributes.optimizers],
             )
         )
+
+        # after_train does not exist
+        # The order of these matters
+        # cbs.append(
+        #     TrainingCallback(
+        #         [TrainingCallbackLocation.AFTER_TRAIN_ITERATION], self.after_train
+        #     )
+        # )
+
+        # refinement after raises errors with vis_counts and max_2Dsize - they are always None and never set
+        # cbs.append(
+        #     TrainingCallback(
+        #         [TrainingCallbackLocation.AFTER_TRAIN_ITERATION],
+        #         self.refinement_after,
+        #         update_every_num_iters=self.config.refine_every,
+        #         args=[training_callback_attributes.optimizers],
+        #     )
+        # )
 
         return cbs
 
