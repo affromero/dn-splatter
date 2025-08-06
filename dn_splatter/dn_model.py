@@ -612,7 +612,7 @@ class DNSplatterModel(SplatfactoModel):
                 absgrad=True,
             )
             # convert normals from [-1,1] to [0,1]
-            normals_im = normals_im / normals_im.norm(dim=-1, keepdim=True)
+            # normals_im = normals_im / normals_im.norm(dim=-1, keepdim=True)
             normals_im = (normals_im + 1) / 2
 
         if hasattr(camera, "metadata"):
@@ -682,6 +682,8 @@ class DNSplatterModel(SplatfactoModel):
             batch["normal"] = self.get_gt_img(batch["normal"])
         if "confidence" in batch:
             confidence = 1 - self.get_gt_img(batch["confidence"]) / 255.0
+        else:
+            confidence = torch.ones_like(depth_out)
 
         if "mask" in batch:
             # batch["mask"] : [H, W, 1]
@@ -751,6 +753,8 @@ class DNSplatterModel(SplatfactoModel):
                 **additional_data,
             )
         elif self.config.regularization_strategy == "ags-mesh":
+            if self.regularization_strategy.depth_loss is None:
+                raise ValueError("Depth loss is not set. It is required for AGS-Mesh.")
             regularization_strategy_loss = self.regularization_strategy(
                 step=self.step,
                 pred_depth=depth_out,
@@ -758,7 +762,7 @@ class DNSplatterModel(SplatfactoModel):
                 confidence_map=confidence,
                 surf_normal=(2 * surface_normal - 1).permute(2, 0, 1),
                 gt_normal=(2 * gt_normal - 1).permute(2, 0, 1),
-                pred_normal=(2 * pred_normal - 1).permute(2, 0, 1),
+                pred_normal=(2 * pred_normal[0] - 1).permute(2, 0, 1),
                 **additional_data,
             )
 
