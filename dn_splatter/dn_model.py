@@ -580,20 +580,11 @@ class DNSplatterModel(SplatfactoModel):
             rots = quat_to_rotmat(quats_crop)
             normals = torch.bmm(rots, normals[:, :, None]).squeeze(-1)
             normals = F.normalize(normals, dim=1)
-            viewdirs = (
-                -means_crop.detach() + camera.camera_to_worlds.detach()[..., :3, 3]
-            )
-            viewdirs = viewdirs / viewdirs.norm(dim=-1, keepdim=True)
-            dots = (normals * viewdirs).sum(-1)
-            negative_dot_indices = dots < 0
-            normals[negative_dot_indices] = -normals[negative_dot_indices]
             # update parameter group normals
             self.gauss_params["normals"] = normals
-            # convert normals from world space to camera space
-            normals = normals @ camera.camera_to_worlds.squeeze(0)[:3, :3]
 
             # Use the current gsplat API for normal rendering
-            _, _, normals_im, _, _, _, _ = rasterization_2dgs(
+            normals_im, _, _, _, _, _, _ = rasterization_2dgs(
                 means=means_crop,
                 quats=quats_crop / quats_crop.norm(dim=-1, keepdim=True),
                 scales=torch.exp(scales_crop).float(),
@@ -611,8 +602,7 @@ class DNSplatterModel(SplatfactoModel):
                 sparse_grad=False,
                 absgrad=True,
             )
-            # convert normals from [-1,1] to [0,1]
-            # normals_im = normals_im / normals_im.norm(dim=-1, keepdim=True)
+            # Convert normals from [-1, 1] to [0, 1] for visualization
             normals_im = (normals_im + 1) / 2
 
         if hasattr(camera, "metadata"):
